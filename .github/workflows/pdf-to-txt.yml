@@ -1,36 +1,180 @@
-# This is a basic workflow to help you get started with Actions
+name: PDF to TXT Converter
 
-name: CI
-
-# Controls when the workflow will run
+# শুধু ম্যানুয়ালি ট্রিগার হবে (Actions ট্যাব থেকে Run workflow) —
+# PDF-এর ডাইরেক্ট ডাউনলোড লিংক আর কনভার্সন মোড ইনপুট হিসেবে দিতে হবে।
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      pdf_url:
+        description: "PDF-এর ডাইরেক্ট ডাউনলোড লিংক"
+        required: true
+        type: string
+      output_name:
+        description: "আউটপুট txt ফাইলের নাম (ফাঁকা রাখলে লিংক থেকে অটো ঠিক করবে, .txt লাগবে না)"
+        required: false
+        type: string
+      mode:
+        description: "কনভার্সন মোড"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - force_bijoy
+          - force_plain
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  convert:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Install dependencies
+        run: pip install --quiet pymupdf bijoy2unicode requests
+
+      - name: Download and convert PDF
+        env:
+          PDF_URL: ${{ inputs.pdf_url }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
+          MODE: ${{ inputs.mode }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          python3 << 'PY'
+          import os
+          import re
+          import sys
+          from urllib.parse import urlparse, unquote, parse_qs
+
+          import requests
+          import pymupdf as fitz
+          from bijoy2unicode import converter
+
+          PDF_URL = os.environ["PDF_URL"].strip()
+          OUTPUT_NAME = os.environ.get("OUTPUT_NAME", "").strip()
+          MODE = os.environ.get("MODE", "auto")
+
+          DOWNLOAD_DIR = "pdf_downloaded"
+          OUT_DIR = "txt"
+          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+          os.makedirs(OUT_DIR, exist_ok=True)
+
+          bijoy_converter = converter.Unicode()
+          BANGLA_RANGE = re.compile(r"[\u0980-\u09FF]")
+
+          def looks_like_bangla_unicode(text: str) -> bool:
+              if not text.strip():
+                  return False
+              bangla_chars = len(BANGLA_RANGE.findall(text))
+              return bangla_chars / max(len(text), 1) > 0.05
+
+          def looks_like_bijoy_garbage(text: str) -> bool:
+              if not text.strip() or looks_like_bangla_unicode(text):
+                  return False
+              bijoy_marker_chars = len(
+                  re.findall(r"[\u2020\u2021\u00AF\u00D8\u00A8\u00A9\u00AA"
+                             r"\u00AB\u00AC\u00AD\u00AE\u00B0-\u00BF]", text)
+              )
+              non_ascii_odd = len(re.findall(r"[^\x00-\x7F]", text))
+              return (bijoy_marker_chars > 0) or (non_ascii_odd / max(len(text), 1) > 0.15)
+
+          def extract_text_per_line(pdf_path: str) -> list:
+              lines = []
+              doc = fitz.open(pdf_path)
+              for page in doc:
+                  lines.extend(page.get_text("text").splitlines())
+              doc.close()
+              return lines
+
+          def convert_lines(lines: list, mode: str) -> str:
+              out_lines = []
+              for line in lines:
+                  if mode == "force_bijoy":
+                      out_lines.append(bijoy_converter.convertBijoyToUnicode(line))
+                  elif mode == "force_plain":
+                      out_lines.append(line)
+                  else:  # auto
+                      if looks_like_bangla_unicode(line):
+                          out_lines.append(line)
+                      elif looks_like_bijoy_garbage(line):
+                          try:
+                              out_lines.append(bijoy_converter.convertBijoyToUnicode(line))
+                          except Exception:
+                              out_lines.append(line)
+                      else:
+                          out_lines.append(line)
+              return "\n".join(out_lines)
+
+          # ---- 1) Download ----
+          print(f"Downloading: {PDF_URL}")
+          try:
+              resp = requests.get(PDF_URL, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+              resp.raise_for_status()
+          except Exception as e:
+              print(f"ERROR: PDF ডাউনলোড ব্যর্থ হয়েছে: {e}")
+              sys.exit(1)
+
+          content = resp.content
+          if not content.startswith(b"%PDF"):
+              print("ERROR: ডাউনলোড করা ফাইলটা আসলে PDF মনে হচ্ছে না (%PDF হেডার নেই)।")
+              print("সম্ভবত লিংকটা সরাসরি ফাইল ডাউনলোড লিংক না (যেমন Google Drive/Dropbox-এর ভিউয়ার লিংক)।")
+              sys.exit(1)
+
+          # ---- 2) Figure out a filename ----
+          if OUTPUT_NAME:
+              base_name = re.sub(r"\.(txt|pdf)$", "", OUTPUT_NAME, flags=re.IGNORECASE)
+          else:
+              cd = resp.headers.get("Content-Disposition", "")
+              m = re.search(r'filename="?([^";]+)"?', cd)
+              if m:
+                  base_name = re.sub(r"\.pdf$", "", unquote(m.group(1)), flags=re.IGNORECASE)
+              else:
+                  parsed_url = urlparse(PDF_URL)
+                  qs = parse_qs(parsed_url.query)
+                  fn_param = qs.get("fn", [""])[0].strip()
+                  if fn_param:
+                      # e.g. ...3832-1.pdf?fn=giyarwen-shareef-ki-barakate -> use the fn value
+                      base_name = unquote(fn_param)
+                  else:
+                      raw_name = os.path.basename(unquote(parsed_url.path)) or "downloaded"
+                      base_name = re.sub(r"\.pdf$", "", raw_name, flags=re.IGNORECASE) or "downloaded"
+
+          base_name = re.sub(r'[\\/*?:"<>|]', "_", base_name).strip() or "downloaded"
+
+          pdf_path = os.path.join(DOWNLOAD_DIR, base_name + ".pdf")
+          with open(pdf_path, "wb") as f:
+              f.write(content)
+          print(f"Saved PDF: {pdf_path} ({len(content)} bytes)")
+
+          # ---- 3) Extract + convert ----
+          try:
+              lines = extract_text_per_line(pdf_path)
+          except Exception as e:
+              print(f"ERROR: PDF পড়তে ব্যর্থ হয়েছে: {e}")
+              sys.exit(1)
+
+          if not any(line.strip() for line in lines):
+              print("ERROR: কোনো সিলেক্টেবল টেক্সট পাওয়া যায়নি (সম্ভবত স্ক্যান করা ইমেজ PDF, OCR লাগবে)।")
+              sys.exit(1)
+
+          result_text = convert_lines(lines, MODE)
+
+          out_path = os.path.join(OUT_DIR, base_name + ".txt")
+          with open(out_path, "w", encoding="utf-8") as f:
+              f.write(result_text)
+
+          print(f"OK: {pdf_path} -> {out_path} (mode={MODE})")
+          PY
+
+      - name: Commit and push converted files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: convert downloaded PDF to TXT"
+          file_pattern: "txt/**.txt pdf_downloaded/**.pdf"
