@@ -71,44 +71,55 @@ jobs:
           ARABIC_RANGE = re.compile(
               r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]"
           )
+          URL_LIKE = re.compile(
+              r"^(https?://|www\.)|\.(com|net|org|info|bd|gov)[/\)\]:;,.!?]*$",
+              re.IGNORECASE,
+          )
+          DIGIT_PUNCT_ONLY = re.compile(r"^[\d\W_]+$")
 
           def already_valid_unicode_script(text: str) -> bool:
               """
-              True if the text already contains real Bangla OR Arabic Unicode
-              characters (e.g. Quranic ayat/dua often embedded as proper
-              Unicode Arabic text inside otherwise-Bijoy Bangla PDFs).
-              Such text must NOT be run through the Bijoy converter.
+              True if text already contains real Bangla OR Arabic Unicode
+              (e.g. Quranic ayat/dua embedded as proper Unicode Arabic text
+              inside otherwise-Bijoy Bangla PDFs). Such text must never be
+              run through the Bijoy converter.
               """
               if not text.strip():
                   return False
               hits = len(BANGLA_RANGE.findall(text)) + len(ARABIC_RANGE.findall(text))
               return hits / max(len(text), 1) > 0.05
 
-          def looks_like_bangla_unicode(text: str) -> bool:
-              if not text.strip():
-                  return False
-              bangla_chars = len(BANGLA_RANGE.findall(text))
-              return bangla_chars / max(len(text), 1) > 0.05
-
-          def looks_like_bijoy_garbage(text: str) -> bool:
+          def safe_bijoy_convert(token: str) -> str:
               """
-              Heuristic: Bijoy-encoded text extracted "as is" from a PDF shows up
-              as Latin letters + a specific set of high-ASCII/Latin-1-supplement
-              symbols (dagger/double-dagger marks, superscript-like glyphs etc.)
-              that Bijoy's legacy encoding reuses for Bangla glyphs.
-
-              IMPORTANT: we deliberately do NOT use "lots of non-ASCII chars" as
-              a signal anymore -- real Arabic/Bangla Unicode text is also mostly
-              non-ASCII, and that generic check used to wrongly flag correct
-              Arabic ayat/dua text as broken Bijoy text and corrupt it.
+              bijoy2unicode throws IndexError on some short/edge-case tokens
+              when converted in isolation (it look-ahead reads past the end
+              of the string). Padding with a trailing space avoids this and
+              is stripped back off afterwards.
               """
-              if not text.strip() or already_valid_unicode_script(text):
-                  return False
-              bijoy_marker_chars = len(
-                  re.findall(r"[\u2020\u2021\u00AF\u00D8\u00A8\u00A9\u00AA"
-                             r"\u00AB\u00AC\u00AD\u00AE\u00B0-\u00BF]", text)
-              )
-              return bijoy_marker_chars > 0
+              try:
+                  converted = bijoy_converter.convertBijoyToUnicode(token + " ")
+                  return converted[:-1] if converted.endswith(" ") else converted
+              except Exception:
+                  try:
+                      return bijoy_converter.convertBijoyToUnicode(token)
+                  except Exception:
+                      return token
+
+          def classify_and_convert_token(token: str, mode: str) -> str:
+              if not token.strip():
+                  return token  # whitespace, keep as-is
+              if mode == "force_plain":
+                  return token
+              if already_valid_unicode_script(token):
+                  return token  # protect genuine Bangla/Arabic text always
+              if mode == "force_bijoy":
+                  return safe_bijoy_convert(token)
+              # auto mode
+              if URL_LIKE.search(token):
+                  return token
+              if DIGIT_PUNCT_ONLY.match(token):
+                  return token
+              return safe_bijoy_convert(token)
 
           def extract_text_per_line(pdf_path: str) -> list:
               lines = []
@@ -121,20 +132,17 @@ jobs:
           def convert_lines(lines: list, mode: str) -> str:
               out_lines = []
               for line in lines:
-                  if mode == "force_bijoy":
-                      out_lines.append(bijoy_converter.convertBijoyToUnicode(line))
-                  elif mode == "force_plain":
+                  if mode == "force_plain":
                       out_lines.append(line)
-                  else:  # auto
-                      if already_valid_unicode_script(line):
-                          out_lines.append(line)
-                      elif looks_like_bijoy_garbage(line):
-                          try:
-                              out_lines.append(bijoy_converter.convertBijoyToUnicode(line))
-                          except Exception:
-                              out_lines.append(line)
-                      else:
-                          out_lines.append(line)
+                      continue
+                  # word-level conversion: splitting per-token (instead of
+                  # deciding for the whole line) is essential because a
+                  # single visual line can mix Bijoy Bangla words, correct
+                  # Arabic Unicode phrases, and plain watermark text.
+                  parts = re.split(r"(\s+)", line)
+                  out_lines.append(
+                      "".join(classify_and_convert_token(p, mode) for p in parts)
+                  )
               return "\n".join(out_lines)
 
           # ---- 1) Download ----
