@@ -68,6 +68,21 @@ jobs:
 
           bijoy_converter = converter.Unicode()
           BANGLA_RANGE = re.compile(r"[\u0980-\u09FF]")
+          ARABIC_RANGE = re.compile(
+              r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]"
+          )
+
+          def already_valid_unicode_script(text: str) -> bool:
+              """
+              True if the text already contains real Bangla OR Arabic Unicode
+              characters (e.g. Quranic ayat/dua often embedded as proper
+              Unicode Arabic text inside otherwise-Bijoy Bangla PDFs).
+              Such text must NOT be run through the Bijoy converter.
+              """
+              if not text.strip():
+                  return False
+              hits = len(BANGLA_RANGE.findall(text)) + len(ARABIC_RANGE.findall(text))
+              return hits / max(len(text), 1) > 0.05
 
           def looks_like_bangla_unicode(text: str) -> bool:
               if not text.strip():
@@ -76,14 +91,24 @@ jobs:
               return bangla_chars / max(len(text), 1) > 0.05
 
           def looks_like_bijoy_garbage(text: str) -> bool:
-              if not text.strip() or looks_like_bangla_unicode(text):
+              """
+              Heuristic: Bijoy-encoded text extracted "as is" from a PDF shows up
+              as Latin letters + a specific set of high-ASCII/Latin-1-supplement
+              symbols (dagger/double-dagger marks, superscript-like glyphs etc.)
+              that Bijoy's legacy encoding reuses for Bangla glyphs.
+
+              IMPORTANT: we deliberately do NOT use "lots of non-ASCII chars" as
+              a signal anymore -- real Arabic/Bangla Unicode text is also mostly
+              non-ASCII, and that generic check used to wrongly flag correct
+              Arabic ayat/dua text as broken Bijoy text and corrupt it.
+              """
+              if not text.strip() or already_valid_unicode_script(text):
                   return False
               bijoy_marker_chars = len(
                   re.findall(r"[\u2020\u2021\u00AF\u00D8\u00A8\u00A9\u00AA"
                              r"\u00AB\u00AC\u00AD\u00AE\u00B0-\u00BF]", text)
               )
-              non_ascii_odd = len(re.findall(r"[^\x00-\x7F]", text))
-              return (bijoy_marker_chars > 0) or (non_ascii_odd / max(len(text), 1) > 0.15)
+              return bijoy_marker_chars > 0
 
           def extract_text_per_line(pdf_path: str) -> list:
               lines = []
@@ -101,7 +126,7 @@ jobs:
                   elif mode == "force_plain":
                       out_lines.append(line)
                   else:  # auto
-                      if looks_like_bangla_unicode(line):
+                      if already_valid_unicode_script(line):
                           out_lines.append(line)
                       elif looks_like_bijoy_garbage(line):
                           try:
